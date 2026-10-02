@@ -38,12 +38,12 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v2
 
-      - name: Install Android 17 toolchain
+      - name: Install Android 35 toolchain
         run: |
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-37" "build-tools;37.0.0"
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle 9.6.1
         uses: gradle/actions/setup-gradle@v4
@@ -120,11 +120,11 @@ jobs:
           
           android {{
               namespace = {json.dumps(package)}
-              compileSdk = 37
+              compileSdk = 35
               defaultConfig {{
                   applicationId = {json.dumps(package)}
-                  minSdk = 34
-                  targetSdk = 37
+                  minSdk = 26
+                  targetSdk = 35
                   versionCode = {version_code}
                   versionName = {json.dumps(version_name)}
               }}

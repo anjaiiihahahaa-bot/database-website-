@@ -4,12 +4,12 @@ plugins {
 
 android {
     namespace = "com.rifxguard.child.template"
-    compileSdk = 37
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.rifxguard.child.template"
-        minSdk = 34
-        targetSdk = 37
+        minSdk = 26
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
     }

